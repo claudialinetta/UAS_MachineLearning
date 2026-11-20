@@ -1,0 +1,8 @@
+.venv/
+__pycache__/
+IRMAS-TrainingData/
+irmas/
+irmas_test/
+*.zip
+emb_panns.npy
+emb_labels.npy
