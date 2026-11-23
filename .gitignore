@@ -6,3 +6,4 @@ irmas_test/
 *.zip
 emb_panns.npy
 emb_labels.npy
+node_modules

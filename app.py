@@ -1,7 +1,13 @@
+"""MusicType: aplikasi Streamlit untuk mengenali instrumen dominan pada audio.
+
+Alur: unggah audio -> potong per 3 detik -> 166 fitur (features.py) ->
+predict_proba pada model SVM -> rata-rata probabilitas seluruh segmen.
+Jalankan dengan: streamlit run app.py
+"""
 import os
 import tempfile
 from pathlib import Path
-
+import tensorflow as tf
 import joblib
 import librosa
 import librosa.display
@@ -11,7 +17,12 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from features import SR, SEG_SEC, load_segments, seg_features
+SEGMENT_SEC = 3.0
+
+from features import (
+    SR, SEG_SEC, load_segments,
+    seg_features, extract_mel
+)
 
 
 # ==========================================
@@ -38,6 +49,21 @@ NAMA = {
     "vio": "Biola",
     "voi": "Vokal"
 }
+
+def nama(kode):
+    return NAMA.get(str(kode), str(kode))
+
+def style_axes(ax):
+    ax.set_facecolor("#211719")
+    ax.tick_params(colors="#E8DCDC")
+    ax.xaxis.label.set_color("#E8DCDC")
+    ax.yaxis.label.set_color("#E8DCDC")
+    ax.title.set_color("#F5E9E9")
+
+    for spine in ax.spines.values():
+        spine.set_color("#765B60")
+
+    ax.grid(color="#765B60", alpha=0.2)
 
 # Palet red velvet
 BG = "#140A0C"
@@ -338,42 +364,26 @@ st.markdown("""
 # ==========================================
 
 @st.cache_resource
-def load_model():
-    return joblib.load("model.joblib")
+def load_models():
+    svm_bundle = joblib.load("model.joblib")
+    cnn = tf.keras.models.load_model("musictype_cnn.keras")
+    preprocessing = joblib.load("cnn_preprocessing.joblib")
+
+    return svm_bundle, cnn, preprocessing
 
 
 try:
-    bundle = load_model()
+    svm_bundle, cnn_model, cnn_preprocessing = load_models()
 
-    model = bundle["model"]
-    best_name = bundle["best_name"]
+    svm_model = svm_bundle["model"]
+    best_name = svm_bundle["best_name"]
 
-    classes = bundle.get("classes", list(model.classes_))
-    class_names = bundle.get("class_names", NAMA)
-    segment_sec = bundle.get("segment_sec", SEG_SEC)
-
-except FileNotFoundError:
-    st.error(
-        "File model.joblib belum ditemukan. "
-        "Jalankan notebook training terlebih dahulu."
-    )
-    st.stop()
+    classes = svm_bundle.get("classes", list(svm_model.classes_))
+    class_names = svm_bundle.get("class_names", NAMA)
 
 except Exception as e:
     st.error(f"Model gagal dimuat: {e}")
     st.stop()
-
-
-def nama(kode):
-    return class_names.get(kode, NAMA.get(kode, str(kode)))
-
-
-def style_axes(ax, fig):
-    fig.patch.set_facecolor(SURFACE)
-    ax.set_facecolor(SURFACE)
-    ax.tick_params(colors=MUTED)
-    ax.xaxis.label.set_color(MUTED)
-    ax.yaxis.label.set_color(MUTED)
 
 
 # ==========================================
@@ -439,6 +449,12 @@ with tab_prediksi:
         unsafe_allow_html=True
     )
 
+    metode = st.radio(
+        "Pilih metode klasifikasi",
+        ["SVM (Machine Learning)", "CNN (Deep Learning)"],
+        horizontal=True
+    )
+
     if uploaded_file is not None:
 
         st.audio(uploaded_file)
@@ -462,11 +478,34 @@ with tab_prediksi:
                     max_seconds=60
                 )
 
-                features = np.asarray([
-                    seg_features(segment) for segment in segments
-                ])
+                if metode == "SVM (Machine Learning)":
 
-                probabilities = model.predict_proba(features)
+                    features = np.asarray([
+                        seg_features(segment) for segment in segments
+                    ])
+
+                    probabilities = svm_model.predict_proba(features)
+                    prediction_classes = svm_model.classes_
+
+                else:
+
+                    mel_segments = np.array([
+                        extract_mel(segment) for segment in segments
+                    ])
+
+                    mel_segments = mel_segments[..., np.newaxis]
+
+                    mean = cnn_preprocessing["mean"]
+                    std = cnn_preprocessing["std"]
+
+                    mel_segments = (mel_segments - mean) / std
+
+                    probabilities = cnn_model.predict(
+                        mel_segments,
+                        verbose=0
+                    )
+
+                    prediction_classes = np.arange(probabilities.shape[1])
 
             # ----------------------------------
             # HASIL PREDIKSI
@@ -475,7 +514,7 @@ with tab_prediksi:
             mean_prob = probabilities.mean(axis=0)
 
             best_index = int(np.argmax(mean_prob))
-            best_class = classes[best_index]
+            best_class = prediction_classes[best_index]
             best_label = nama(best_class)
 
             confidence = mean_prob[best_index] * 100
@@ -535,7 +574,7 @@ with tab_prediksi:
 
             prob_html = ""
             for rank, idx in enumerate(sorted_idx):
-                label = nama(classes[idx])
+                label = nama(prediction_classes[idx])
                 value = float(mean_prob[idx])
                 top_class = " top" if rank == 0 else ""
                 prob_html += (
@@ -600,8 +639,8 @@ with tab_prediksi:
                 rows.append({
                     "Segmen": f"{i + 1:02d}",
                     "Waktu": (
-                        f"{i * segment_sec:.1f} - "
-                        f"{(i + 1) * segment_sec:.1f} detik"
+                        f"{i * SEGMENT_SEC:.1f} - "
+                        f"{(i + 1) * SEGMENT_SEC:.1f} detik"
                     ),
                     "Prediksi": prediction,
                     "Confidence": f"{conf * 100:.1f}%",
@@ -732,6 +771,12 @@ with tab_hasil:
         "yang digunakan dalam eksperimen MusicType."
     )
 
+    st.caption(
+        "Tabel berikut berasal dari 5-fold StratifiedGroupKFold pada 6.705 "
+        "klip IRMAS dengan 166 fitur audio dan parameter awal setiap algoritma "
+        "(sebelum tuning). Waktu dalam detik."
+    )
+
     result_path = Path("results_summary.csv")
 
     if result_path.exists():
@@ -781,20 +826,48 @@ with tab_hasil:
             "Jalankan notebook training terlebih dahulu."
         )
 
-    # CONFUSION MATRIX
-    matrix_path = Path("confusion_matrix.png")
+    # HASIL EVALUASI CNN
+    cnn_path = Path("cnn_results.csv")
 
-    if matrix_path.exists():
+    if cnn_path.exists():
 
         st.markdown(
-            '<div class="section-title">Confusion matrix</div>',
+            '<div class="section-title">Performa CNN</div>',
             unsafe_allow_html=True
         )
 
-        st.image(
-            str(matrix_path),
-            use_container_width=True
+        cnn_results = pd.read_csv(cnn_path)
+
+        st.dataframe(
+            cnn_results,
+            use_container_width=True,
+            hide_index=True
         )
+
+    # CONFUSION MATRIX SVM DAN CNN
+    st.markdown(
+        '<div class="section-title">Confusion Matrix</div>',
+        unsafe_allow_html=True
+    )
+
+    col_svm, col_cnn = st.columns(2)
+
+    matrix_path = Path("confusion_matrix.png")
+    cnn_matrix_path = Path("cnn_confusion_matrix.png")
+
+    with col_svm:
+        st.markdown("**SVM**")
+        if matrix_path.exists():
+            st.image(str(matrix_path), use_container_width=True)
+        else:
+            st.info("Confusion Matrix SVM belum tersedia.")
+
+    with col_cnn:
+        st.markdown("**CNN**")
+        if cnn_matrix_path.exists():
+            st.image(str(cnn_matrix_path), use_container_width=True)
+        else:
+            st.info("Confusion Matrix CNN belum tersedia.")
 
     st.divider()
 
