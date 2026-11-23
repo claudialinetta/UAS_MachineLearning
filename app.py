@@ -53,7 +53,9 @@ NAMA = {
 def nama(kode):
     return NAMA.get(str(kode), str(kode))
 
-def style_axes(ax):
+def style_axes(ax, fig=None):
+    if fig is not None:
+        fig.patch.set_facecolor("#140A0C")
     ax.set_facecolor("#211719")
     ax.tick_params(colors="#E8DCDC")
     ax.xaxis.label.set_color("#E8DCDC")
@@ -386,6 +388,33 @@ except Exception as e:
     st.stop()
 
 
+def resolve_cnn_classes(n_output):
+    """Urutan kelas output CNN (kode seperti 'voi', 'pia', dst.)."""
+    candidates = []
+
+    if isinstance(cnn_preprocessing, dict):
+        for key in ("classes", "class_names", "labels", "label_names"):
+            if key in cnn_preprocessing:
+                candidates.append(cnn_preprocessing[key])
+
+        encoder = cnn_preprocessing.get("label_encoder")
+        if encoder is not None and hasattr(encoder, "classes_"):
+            candidates.append(encoder.classes_)
+
+    candidates.append(classes)
+    candidates.append(sorted(NAMA.keys()))
+
+    for cand in candidates:
+        try:
+            cand = [str(c) for c in cand]
+        except TypeError:
+            continue
+        if len(cand) == n_output and all(c in NAMA for c in cand):
+            return cand
+
+    return [str(c) for c in range(n_output)]
+
+
 # ==========================================
 # 4. HEADER
 # ==========================================
@@ -505,7 +534,9 @@ with tab_prediksi:
                         verbose=0
                     )
 
-                    prediction_classes = np.arange(probabilities.shape[1])
+                    prediction_classes = np.array(
+                        resolve_cnn_classes(probabilities.shape[1])
+                    )
 
             # ----------------------------------
             # HASIL PREDIKSI
@@ -625,13 +656,13 @@ with tab_prediksi:
                 conf = probabilities[i, idx[0]]
 
                 prediction = (
-                    nama(classes[idx[0]])
+                    nama(prediction_classes[idx[0]])
                     if conf >= threshold
                     else "Tidak yakin"
                 )
 
                 top3 = ", ".join([
-                    f"{nama(classes[j])} "
+                    f"{nama(prediction_classes[j])} "
                     f"({probabilities[i, j] * 100:.1f}%)"
                     for j in idx
                 ])
