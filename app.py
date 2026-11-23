@@ -1,13 +1,14 @@
 """MusicType: aplikasi Streamlit untuk mengenali instrumen dominan pada audio.
 
-Alur: unggah audio -> potong per 3 detik -> 166 fitur (features.py) ->
-predict_proba pada model SVM -> rata-rata probabilitas seluruh segmen.
-Jalankan dengan: streamlit run app.py
+Alur: unggah audio -> potong per 3 detik -> ekstraksi fitur ->
+prediksi probabilitas (SVM atau CNN HPSS-EfficientNet) -> rata-rata seluruh segmen.
+Jalankan dengan: streamlit run app_2.py
 """
 import os
 import tempfile
 from pathlib import Path
 import tensorflow as tf
+from tensorflow.keras import layers
 import joblib
 import librosa
 import librosa.display
@@ -21,8 +22,30 @@ SEGMENT_SEC = 3.0
 
 from features import (
     SR, SEG_SEC, load_segments,
-    seg_features, extract_mel
+    seg_features
 )
+
+
+# ==========================================
+# CUSTOM LAYER UNTUK MODEL CNN BARU
+# ==========================================
+
+class SpecAugment(layers.Layer):
+    def __init__(self, freq_mask_param=16, time_mask_param=16, **kwargs):
+        super().__init__(**kwargs)
+        self.freq_mask_param = freq_mask_param
+        self.time_mask_param = time_mask_param
+
+    def call(self, inputs, training=None):
+        return inputs  # Augmentasi nonaktif saat prediksi (inferensi)
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            "freq_mask_param": self.freq_mask_param,
+            "time_mask_param": self.time_mask_param,
+        })
+        return config
 
 
 # ==========================================
@@ -362,14 +385,17 @@ st.markdown("""
 
 
 # ==========================================
-# 3. LOAD MODEL
+# 3. LOAD MODEL & EKSTRAKSI CNN 3-CHANNEL
 # ==========================================
 
 @st.cache_resource
 def load_models():
     svm_bundle = joblib.load("model.joblib")
-    cnn = tf.keras.models.load_model("musictype_cnn.keras")
-    preprocessing = joblib.load("cnn_preprocessing.joblib")
+    cnn = tf.keras.models.load_model(
+        "best_irmas_hpss_efficientnet.keras",
+        custom_objects={"SpecAugment": SpecAugment}
+    )
+    preprocessing = joblib.load("cnn_hpss_preprocessing.joblib")
 
     return svm_bundle, cnn, preprocessing
 
@@ -386,6 +412,56 @@ try:
 except Exception as e:
     st.error(f"Model gagal dimuat: {e}")
     st.stop()
+
+
+def extract_3ch_segment(y_seg, config):
+    """Ekstraksi fitur 3-channel (HPSS Harmonik, Perkusif, Delta) per segmen 3 detik."""
+    sr = config["sr"]
+    target_samples = config["target_samples"]
+    n_mels = config["n_mels"]
+    n_fft = config["n_fft"]
+    hop_length = config["hop_length"]
+    target_frames = config["target_frames"]
+
+    # Pastikan panjang sampel tepat 3 detik
+    if len(y_seg) < target_samples:
+        y_seg = np.pad(y_seg, (0, target_samples - len(y_seg)))
+    else:
+        y_seg = y_seg[:target_samples]
+
+    # Pisahkan komponen harmonik dan perkusif
+    y_harm, y_perc = librosa.effects.hpss(y_seg)
+
+    mel_harm = librosa.feature.melspectrogram(
+        y=y_harm, sr=sr, n_fft=n_fft, hop_length=hop_length, n_mels=n_mels
+    )
+    mel_perc = librosa.feature.melspectrogram(
+        y=y_perc, sr=sr, n_fft=n_fft, hop_length=hop_length, n_mels=n_mels
+    )
+
+    log_harm = librosa.power_to_db(mel_harm, ref=np.max)
+    log_perc = librosa.power_to_db(mel_perc, ref=np.max)
+    delta_harm = librosa.feature.delta(log_harm)
+
+    def fix_frames(spec):
+        if spec.shape[1] < target_frames:
+            return np.pad(spec, ((0, 0), (0, target_frames - spec.shape[1])), mode="edge")
+        return spec[:, :target_frames]
+
+    stacked = np.stack([
+        fix_frames(log_harm),
+        fix_frames(log_perc),
+        fix_frames(delta_harm)
+    ], axis=-1)
+
+    for c in range(3):
+        c_min, c_max = stacked[:, :, c].min(), stacked[:, :, c].max()
+        if c_max - c_min > 1e-6:
+            stacked[:, :, c] = (stacked[:, :, c] - c_min) / (c_max - c_min) * 255.0
+        else:
+            stacked[:, :, c] = 0.0
+
+    return stacked.astype(np.float32)
 
 
 def resolve_cnn_classes(n_output):
@@ -518,16 +594,10 @@ with tab_prediksi:
 
                 else:
 
-                    mel_segments = np.array([
-                        extract_mel(segment) for segment in segments
+                    mel_segments = np.asarray([
+                        extract_3ch_segment(segment, cnn_preprocessing)
+                        for segment in segments
                     ])
-
-                    mel_segments = mel_segments[..., np.newaxis]
-
-                    mean = cnn_preprocessing["mean"]
-                    std = cnn_preprocessing["std"]
-
-                    mel_segments = (mel_segments - mean) / std
 
                     probabilities = cnn_model.predict(
                         mel_segments,
