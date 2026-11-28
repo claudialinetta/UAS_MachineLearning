@@ -6,3 +6,4 @@ librosa
 scikit-learn
 joblib
 streamlit
+tensorflow==2.21.0

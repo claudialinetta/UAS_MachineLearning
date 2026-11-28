@@ -1,7 +1,7 @@
 """MusicType: aplikasi Streamlit untuk mengenali instrumen dominan pada audio.
 
 Alur: unggah audio -> potong per 3 detik -> ekstraksi fitur ->
-prediksi probabilitas (SVM atau CNN HPSS-EfficientNet) -> rata-rata seluruh segmen.
+prediksi probabilitas (Ensemble CNN + SVM, SVM, atau CNN HPSS-EfficientNet) -> rata-rata seluruh segmen.
 Jalankan dengan: streamlit run app_2.py
 """
 import os
@@ -18,6 +18,9 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
+BASE_DIR = Path(__file__).parent
+MODELS_DIR = BASE_DIR / "models"
+RESULTS_DIR = BASE_DIR / "results"
 SEGMENT_SEC = 3.0
 
 from features import (
@@ -380,6 +383,27 @@ st.markdown("""
 
     hr { border-color: var(--line); }
     footer { visibility: hidden; }
+
+    /* Opsi metode: semua opsi redup */
+        div[data-testid="stRadio"] [role="radiogroup"] label,
+        div[data-testid="stRadio"] [role="radiogroup"] label * {
+            color: var(--muted) !important;
+            font-weight: 500 !important;
+        }
+    
+        /* Opsi yang terpilih: terang dan tebal */
+        div[data-testid="stRadio"] [role="radiogroup"] label:has(input:checked),
+        div[data-testid="stRadio"] [role="radiogroup"] label:has(input:checked) *,
+        div[data-testid="stRadio"] [role="radiogroup"] label:has(input[aria-checked="true"]),
+        div[data-testid="stRadio"] [role="radiogroup"] label:has(input[aria-checked="true"]) * {
+            color: var(--cream) !important;
+            font-weight: 700 !important;
+        }
+
+    /* Judul "Pilih metode klasifikasi" */
+    div[data-testid="stRadio"] [data-testid="stWidgetLabel"] p {
+        color: var(--cream) !important;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -390,18 +414,19 @@ st.markdown("""
 
 @st.cache_resource
 def load_models():
-    svm_bundle = joblib.load("model.joblib")
+    svm_bundle = joblib.load(MODELS_DIR / "svm_calibrated.joblib")
     cnn = tf.keras.models.load_model(
-        "best_irmas_hpss_efficientnet.keras",
+        MODELS_DIR / "best_irmas_hpss_efficientnet_v2.keras",
         custom_objects={"SpecAugment": SpecAugment}
     )
-    preprocessing = joblib.load("cnn_hpss_preprocessing.joblib")
+    preprocessing = joblib.load(MODELS_DIR / "cnn_hpss_preprocessing.joblib")
+    ensemble_cfg = joblib.load(MODELS_DIR / "ensemble_config.joblib")
 
-    return svm_bundle, cnn, preprocessing
+    return svm_bundle, cnn, preprocessing, ensemble_cfg
 
 
 try:
-    svm_bundle, cnn_model, cnn_preprocessing = load_models()
+    svm_bundle, cnn_model, cnn_preprocessing, ens_cfg = load_models()
 
     svm_model = svm_bundle["model"]
     best_name = svm_bundle["best_name"]
@@ -412,6 +437,20 @@ try:
 except Exception as e:
     st.error(f"Model gagal dimuat: {e}")
     st.stop()
+
+if ens_cfg is not None:
+    model_dipakai = "Ensemble: EfficientNetB0 (HPSS) + SVM RBF terkalibrasi"
+else:
+    model_dipakai = best_name
+
+
+def svm_class_codes():
+    """Kode kelas (cel, cla, ...) sesuai urutan kolom predict_proba SVM."""
+    codes = [str(c) for c in svm_model.classes_]
+    # SVM baru dilatih dengan label angka 0..10, petakan ke kode kelas
+    if all(c.isdigit() for c in codes):
+        codes = [str(classes[int(c)]) for c in codes]
+    return codes
 
 
 def extract_3ch_segment(y_seg, config):
@@ -554,9 +593,13 @@ with tab_prediksi:
         unsafe_allow_html=True
     )
 
+    opsi_metode = ["SVM (Machine Learning)", "CNN (Deep Learning)"]
+    if ens_cfg is not None:
+        opsi_metode = ["Ensemble CNN + SVM (Paling Akurat)"] + opsi_metode
+
     metode = st.radio(
         "Pilih metode klasifikasi",
-        ["SVM (Machine Learning)", "CNN (Deep Learning)"],
+        opsi_metode,
         horizontal=True
     )
 
@@ -583,30 +626,41 @@ with tab_prediksi:
                     max_seconds=60
                 )
 
-                if metode == "SVM (Machine Learning)":
+                svm_codes = svm_class_codes()
+                p_svm = None
+                p_cnn = None
 
+                if metode != "CNN (Deep Learning)":
                     features = np.asarray([
                         seg_features(segment) for segment in segments
                     ])
+                    p_svm = svm_model.predict_proba(features)
 
-                    probabilities = svm_model.predict_proba(features)
-                    prediction_classes = svm_model.classes_
-
-                else:
-
+                if metode != "SVM (Machine Learning)":
                     mel_segments = np.asarray([
                         extract_3ch_segment(segment, cnn_preprocessing)
                         for segment in segments
                     ])
+                    p_cnn = cnn_model.predict(mel_segments, verbose=0)
 
-                    probabilities = cnn_model.predict(
-                        mel_segments,
-                        verbose=0
-                    )
+                if metode == "SVM (Machine Learning)":
+                    probabilities = p_svm
+                    prediction_classes = np.array(svm_codes)
 
+                elif metode == "CNN (Deep Learning)":
+                    probabilities = p_cnn
                     prediction_classes = np.array(
-                        resolve_cnn_classes(probabilities.shape[1])
+                        resolve_cnn_classes(p_cnn.shape[1])
                     )
+
+                else:
+                    # Ensemble: urutkan kolom SVM mengikuti urutan kelas CNN,
+                    # lalu rata-ratakan berbobot (bobot dipilih di data validasi).
+                    cnn_codes = resolve_cnn_classes(p_cnn.shape[1])
+                    urutan = [svm_codes.index(c) for c in cnn_codes]
+                    w_cnn = float(ens_cfg["w_cnn"])
+                    probabilities = w_cnn * p_cnn + (1 - w_cnn) * p_svm[:, urutan]
+                    prediction_classes = np.array(cnn_codes)
 
             # ----------------------------------
             # HASIL PREDIKSI
@@ -863,7 +917,7 @@ with tab_prediksi:
 with tab_hasil:
 
     st.markdown(
-        '<div class="section-title">Performa model</div>',
+        '<div class="section-title">Performa Model</div>',
         unsafe_allow_html=True
     )
 
@@ -873,76 +927,47 @@ with tab_hasil:
     )
 
     st.caption(
-        "Tabel berikut berasal dari 5-fold StratifiedGroupKFold pada 6.705 "
-        "klip IRMAS dengan 166 fitur audio dan parameter awal setiap algoritma "
-        "(sebelum tuning). Waktu dalam detik."
+        "Akurasi adalah persentase tebakan yang benar, sedangkan F1 macro menilai performa "
+        "rata-rata semua kelas sehingga lebih adil karena jumlah data per instrumen tidak sama."
     )
 
-    result_path = Path("results_summary.csv")
+    # PERBANDINGAN SEMUA MODEL PADA DATA TEST (Colab)
+    ringkasan_path = RESULTS_DIR / "hasil_evaluasi_test.csv"
 
-    if result_path.exists():
-
-        results = pd.read_csv(
-            result_path,
-            index_col=0
-        )
-
-        # TABEL HASIL
-        st.markdown("**Perbandingan algoritma**")
-
-        st.dataframe(
-            results,
-            use_container_width=True
-        )
-
-        # GRAFIK PERBANDINGAN
-        available_metrics = [
-            col for col in [
-                "F1_macro",
-                "Akurasi",
-                "Precision",
-                "Recall"
-            ]
-            if col in results.columns
-        ]
-
-        if available_metrics:
-
-            st.markdown(
-                '<div class="section-title">Grafik perbandingan</div>',
-                unsafe_allow_html=True
-            )
-
-            chart_data = results[available_metrics].copy()
-
-            st.bar_chart(
-                chart_data,
-                color=["#7B1E2B", "#C2463F", "#E3B778", "#F5E9DF"][:len(available_metrics)]
-            )
-
-    else:
-
-        st.info(
-            "Hasil eksperimen belum tersedia. "
-            "Jalankan notebook training terlebih dahulu."
-        )
-
-    # HASIL EVALUASI CNN
-    cnn_path = Path("cnn_results.csv")
-
-    if cnn_path.exists():
+    if ringkasan_path.exists():
 
         st.markdown(
-            '<div class="section-title">Performa CNN</div>',
+            '<div class="section-title">Perbandingan Model pada Data Test</div>',
             unsafe_allow_html=True
         )
 
-        cnn_results = pd.read_csv(cnn_path)
+        st.caption(
+            "Semua model dilatih dan diuji pada split yang sama: 60% train, "
+            "20% validasi, 20% test, dibagi berdasarkan grup lagu."
+        )
+
+        ringkasan = pd.read_csv(ringkasan_path)
 
         st.dataframe(
-            cnn_results,
+            ringkasan,
             use_container_width=True,
             hide_index=True
+        )
+
+        st.markdown(
+            '<div class="section-title">Grafik Perbandingan</div>',
+            unsafe_allow_html=True
+        )
+
+        st.bar_chart(
+            ringkasan.set_index("Model")[["Akurasi", "Precision", "Recall", "F1_macro"]],
+            color=["#7B1E2B", "#C2463F", "#E3B778", "#F5E9DF"]
+        )
+
+    else:
+        st.info(
+            "Hasil eksperimen belum tersedia. "
+            "Jalankan notebook Colab terlebih dahulu."
         )
 
     # CONFUSION MATRIX SVM DAN CNN
@@ -953,8 +978,8 @@ with tab_hasil:
 
     col_svm, col_cnn = st.columns(2)
 
-    matrix_path = Path("confusion_matrix.png")
-    cnn_matrix_path = Path("cnn_confusion_matrix.png")
+    matrix_path = RESULTS_DIR / "confusion_matrix.png"
+    cnn_matrix_path = RESULTS_DIR / "cnn_confusion_matrix.png"
 
     with col_svm:
         st.markdown("**SVM**")
@@ -970,12 +995,17 @@ with tab_hasil:
         else:
             st.info("Confusion Matrix CNN belum tersedia.")
 
+    ens_matrix_path = RESULTS_DIR / "ensemble_confusion_matrix.png"
+    if ens_matrix_path.exists():
+        st.markdown("**Ensemble CNN + SVM**")
+        st.image(str(ens_matrix_path), use_container_width=True)
+
     st.divider()
 
     st.markdown(f"""
     <div class="info-card">
         <div class="info-label">Model yang dipakai</div>
-        <div class="info-value">{best_name}</div>
+        <div class="info-value">{model_dipakai}</div>
         <div class="info-note">
             Model yang digunakan untuk melakukan klasifikasi audio.
         </div>
